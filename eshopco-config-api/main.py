@@ -27,11 +27,27 @@ DEFAULTS = {
 
 BASE_DIR = Path(__file__).resolve().parent
 
+ALIASES = {
+    "app_port": "port",
+    "app_workers": "workers",
+    "num_workers": "workers",
+    "app_debug": "debug",
+    "app_log_level": "log_level",
+    "app_api_key": "api_key",
+}
+
+
+def normalize_key(key):
+    key = key.strip().lower()
+    return ALIASES.get(key, key)
+
 
 def to_bool(value):
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+    return str(value).strip().lower() in {
+        "true", "1", "yes", "on"
+    }
 
 
 def coerce(key, value):
@@ -42,66 +58,72 @@ def coerce(key, value):
     return str(value)
 
 
-def normalize_key(key):
-    key = key.strip().lower()
+def load_yaml_config():
+    config_file = BASE_DIR / "config.development.yaml"
+    if not config_file.exists():
+        return {}
 
-    aliases = {
-        "app_port": "port",
-        "app_workers": "workers",
-        "num_workers": "workers",
-        "app_debug": "debug",
-        "app_log_level": "log_level",
-        "app_api_key": "api_key",
+    with config_file.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    return {
+        normalize_key(key): value
+        for key, value in data.items()
+        if normalize_key(key) in DEFAULTS
     }
-    return aliases.get(key, key)
+
+
+def load_dotenv_config():
+    data = dotenv_values(BASE_DIR / ".env")
+    return {
+        normalize_key(key): value
+        for key, value in data.items()
+        if value is not None and normalize_key(key) in DEFAULTS
+    }
+
+
+def load_os_config():
+    result = {}
+
+    for key, value in os.environ.items():
+        normalized = normalize_key(key)
+
+        if normalized not in DEFAULTS:
+            continue
+
+        # Only use the specified application environment variables.
+        if key.startswith("APP_") or key == "NUM_WORKERS":
+            result[normalized] = value
+
+    return result
 
 
 @app.get("/")
 def get_config(set: list[str] | None = Query(default=None)):
+    # Precedence: defaults < YAML < .env < OS environment < CLI overrides.
     config = DEFAULTS.copy()
+    config.update(load_yaml_config())
+    config.update(load_dotenv_config())
+    config.update(load_os_config())
 
-    # YAML configuration
-    config_path = BASE_DIR / "config.development.yaml"
-    if config_path.exists():
-        with config_path.open(encoding="utf-8") as file:
-            yaml_config = yaml.safe_load(file) or {}
-
-        for key, value in yaml_config.items():
-            normalized = normalize_key(key)
-            if normalized in config:
-                config[normalized] = value
-
-    # .env configuration
-    env_file = dotenv_values(BASE_DIR / ".env")
-    for key, value in env_file.items():
-        if value is None:
-            continue
-        normalized = normalize_key(key)
-        if normalized in config:
-            config[normalized] = value
-
-    # OS environment variables take precedence
-    for key, value in os.environ.items():
-        normalized = normalize_key(key)
-        if normalized in config and (
-            key.startswith("APP_") or key == "NUM_WORKERS"
-        ):
-            config[normalized] = value
-
-    # Query overrides have the highest precedence
+    # Apply each query override to its own key only.
     for item in set or []:
         if "=" not in item:
             continue
-        key, value = item.split("=", 1)
-        normalized = normalize_key(key)
-        if normalized in config:
-            config[normalized] = value
 
-    # Coerce types and mask secrets
+        key, value = item.split("=", 1)
+        key = normalize_key(key)
+
+        if key in config:
+            config[key] = value
+
+    # Convert values to the expected types.
     result = {
         key: coerce(key, value)
         for key, value in config.items()
     }
+
+    # Never expose the real API key.
     result["api_key"] = "****"
 
     return result
